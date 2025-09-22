@@ -10,7 +10,7 @@ const {
 const validate = require("../middlewares/validate.middleware");
 const { createClubSchema, updateClubSchema } = require("../validators/club.validators");
 const protect = require("../middlewares/auth.middleware");
-const roleAuth = require("../middlewares/role.middleware");
+const roleAuth = require("../middlewares/permission.middleware");
 
 const router = express.Router();
 
