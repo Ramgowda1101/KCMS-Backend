@@ -1,9 +1,10 @@
-const roles = require("../models/role.model");
+const rolesDef = require("../models/role.model");
 const { errorResponse } = require("../utils/responseHelper");
 
 /**
- * Permission + scope-based authorization middleware
- * @param {string} permission - Permission required
+ * authorize(permission)
+ *  - checks if any of user's roles provide the permission
+ *  - attaches scopes to req.user.scopes for downstream controllers
  */
 const authorize = (permission) => {
   return (req, res, next) => {
@@ -13,27 +14,35 @@ const authorize = (permission) => {
 
     const userRoles = req.user.roles;
 
-    // Collect all permissions and scopes
-    let userPermissions = [];
-    let userScopes = [];
+    // aggregate permissions & scopes
+    const userPermissions = new Set();
+    const userScopes = new Set();
 
     userRoles.forEach((role) => {
-      if (roles[role]) {
-        userPermissions = [...userPermissions, ...roles[role].permissions];
-        userScopes.push(roles[role].scope);
+      const def = rolesDef[role];
+      if (def) {
+        (def.permissions || []).forEach((p) => userPermissions.add(p));
+        userScopes.add(def.scope);
       }
     });
 
-    // Check if user has the required permission
-    if (!userPermissions.includes(permission)) {
+    if (!userPermissions.has(permission)) {
       return errorResponse(res, "Forbidden: insufficient permissions", 403);
     }
 
-    // Attach scopes to req for controller logic
-    req.user.scopes = userScopes;
-
+    // expose scope to controller for fine-grained checks
+    req.user.scopes = Array.from(userScopes);
     next();
   };
 };
 
-module.exports = authorize;
+
+const roleAuth = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user || !req.user.roles) return errorResponse(res, "Not authorized", 403);
+    const has = req.user.roles.some(r => allowedRoles.includes(r));
+    if (!has) return errorResponse(res, "Forbidden: insufficient role", 403);
+    next();
+  };
+};
+module.exports = { authorize, roleAuth };

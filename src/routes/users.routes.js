@@ -8,7 +8,7 @@ const {
 } = require("../controllers/users.controller");
 
 const protect = require("../middlewares/auth.middleware");
-const roleAuth = require("../middlewares/permission.middleware");
+const { roleAuth } = require("../middlewares/permission.middleware");
 
 const router = express.Router();
 

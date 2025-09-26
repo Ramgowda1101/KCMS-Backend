@@ -1,33 +1,29 @@
 const jwt = require("jsonwebtoken");
-const asyncHandler = require("express-async-handler");
-const User = require("../models/user.model");
+const { errorResponse } = require("../utils/responseHelper");
 
-const protect = asyncHandler(async (req, res, next) => {
-  let token;
-  if (req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
-    try {
-      token = req.headers.authorization.split(" ")[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-      req.user = await User.findById(decoded.id).select("-passwordHash");
-
-      if (!req.user) {
-        res.status(401);
-        throw new Error("Not authorized, user not found");
-      }
-
-      next();
-    } catch (err) {
-      console.error(err);
-      res.status(401);
-      throw new Error("Not authorized, token failed");
-    }
+const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return errorResponse(res, "No token provided", 401);
   }
 
-  if (!token) {
-    res.status(401);
-    throw new Error("Not authorized, no token");
-  }
-});
+  const token = authHeader.split(" ")[1];
 
-module.exports = protect;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // attach canonical user shape for controllers: both id and _id present
+    req.user = {
+      id: decoded.id,
+      _id: decoded.id,
+      roleNumber: decoded.roleNumber || null,
+      roles: decoded.roles || [],
+    };
+
+    next();
+  } catch (err) {
+    return errorResponse(res, "Invalid or expired token", 401);
+  }
+};
+
+module.exports = authMiddleware;

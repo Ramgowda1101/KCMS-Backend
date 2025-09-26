@@ -1,15 +1,19 @@
-exports.successResponse = (res, message, data = {}, statusCode = 200) => {
-  return res.status(statusCode).json({
+// src/utils/responseHelper.js
+function successResponse(res, message = "Success", data = {}, status = 200) {
+  return res.status(status).json({
     success: true,
     message,
     data,
   });
-};
+}
 
-exports.errorResponse = (res, message, statusCode = 500, details = []) => {
-  return res.status(statusCode).json({
+function errorResponse(res, message = "Error", status = 400, errors = null) {
+  const payload = {
     success: false,
     message,
-    details,
-  });
-};
+  };
+  if (errors) payload.errors = errors;
+  return res.status(status).json(payload);
+}
+
+module.exports = { successResponse, errorResponse };

@@ -1,47 +1,19 @@
+// src/controllers/auth.controller.js
 const asyncHandler = require("express-async-handler");
 const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const crypto = require("crypto");
 const User = require("../models/user.model");
-const Session = require("../models/session.model");
+const authService = require("../services/auth.service");
 const { successResponse, errorResponse } = require("../utils/responseHelper");
+const { logAudit } = require("../services/audit.service");
+const { sendNotification } = require("../utils/notifications");
 
-// Generate Access Token (JWT)
-const generateAccessToken = (user) => {
-  return jwt.sign(
-    { id: user._id, roleNumber: user.roleNumber, roles: user.roles },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || "15m" }
-  );
-};
-
-// Generate Refresh Token (Random + store SHA256 + bcrypt in DB)
-const generateRefreshToken = async (user, req) => {
-  const refreshToken = crypto.randomBytes(40).toString("hex");
-
-  // SHA256 for lookup
-  const sha256Hash = crypto.createHash("sha256").update(refreshToken).digest("hex");
-
-  // bcrypt for verification
-  const bcryptHash = await bcrypt.hash(refreshToken, 10);
-
-  // Save session
-  await Session.create({
-    user: user._id,
-    sha256Hash,
-    bcryptHash,
-    ip: req.ip,
-    userAgent: req.headers["user-agent"],
-  });
-
-  return refreshToken;
-};
-
-// @desc Register user
+/**
+ * Register user
+ */
 exports.register = asyncHandler(async (req, res) => {
   const { name, roleNumber, email, password } = req.body;
 
-  // Check duplicates
+  // Validate duplicates
   const existingUser = await User.findOne({ $or: [{ roleNumber }, { email }] });
   if (existingUser) {
     return errorResponse(res, "User with this role number or email already exists", 400);
@@ -51,7 +23,7 @@ exports.register = asyncHandler(async (req, res) => {
   const salt = await bcrypt.genSalt(10);
   const passwordHash = await bcrypt.hash(password, salt);
 
-  // Create user
+  // Create user in pending verification state
   const user = await User.create({
     name,
     roleNumber,
@@ -61,7 +33,29 @@ exports.register = asyncHandler(async (req, res) => {
     verificationStatus: "pending",
   });
 
-  successResponse(
+  // Audit: user created (actor = system or creator)
+  await logAudit({
+    actor: user._id,
+    action: "user:register",
+    resourceType: "User",
+    resourceId: user._id.toString(),
+    after: { name: user.name, roleNumber: user.roleNumber, email: user.email },
+    reason: "User registration",
+  });
+
+  // Send welcome / verification email (best-effort)
+  try {
+    await sendNotification("Welcome to KMIT Clubs! Please verify your account.", user._id.toString(), {
+      channel: "email",
+      title: "Welcome to KMIT Clubs",
+      createdBy: user._id,
+    });
+  } catch (err) {
+    // non-fatal
+    console.error("Notification error (non-fatal):", err && err.message ? err.message : err);
+  }
+
+  return successResponse(
     res,
     "User registered successfully. Please verify your account.",
     {
@@ -78,30 +72,49 @@ exports.register = asyncHandler(async (req, res) => {
   );
 });
 
-// @desc Login user
+/**
+ * Login user
+ * Accepts roleNumber OR email and password.
+ */
 exports.login = asyncHandler(async (req, res) => {
   const { roleNumber, email, password } = req.body;
 
-  // Allow login with either roleNumber or email
-  const user = await User.findOne({
-    $or: [{ roleNumber }, { email }],
-  });
-
-  if (!user) {
-    return errorResponse(res, "Invalid credentials", 401);
-  }
+  // Find user by roleNumber or email
+  const user = await User.findOne({ $or: [{ roleNumber }, { email }] });
+  if (!user) return errorResponse(res, "Invalid credentials", 401);
 
   const isMatch = await bcrypt.compare(password, user.passwordHash);
-  if (!isMatch) {
-    return errorResponse(res, "Invalid credentials", 401);
+  if (!isMatch) return errorResponse(res, "Invalid credentials", 401);
+
+  // Block deactivated or rejected accounts
+  if (user.verificationStatus === "deactivated" || user.verificationStatus === "rejected") {
+    return errorResponse(res, "Account is not active", 403);
   }
 
-  const accessToken = generateAccessToken(user);
-  const refreshToken = await generateRefreshToken(user, req);
+  // Optionally warn if pending verification (but allow login)
+  const warnings = [];
+  if (user.verificationStatus === "pending") {
+    warnings.push("Account verification pending");
+  }
 
-  successResponse(res, "Login successful", {
+  // Create tokens
+  const accessToken = authService.createAccessToken(user);
+  const refreshToken = await authService.createRefreshToken(user, req);
+
+  // Audit login
+  await logAudit({
+    actor: user._id,
+    action: "auth:login",
+    resourceType: "User",
+    resourceId: user._id.toString(),
+    after: { roles: user.roles },
+    reason: "User login",
+  });
+
+  return successResponse(res, "Login successful", {
     accessToken,
     refreshToken,
+    warnings,
     user: {
       id: user._id,
       name: user.name,
@@ -112,54 +125,123 @@ exports.login = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc Refresh Access Token
+/**
+ * Refresh access token (rotate refresh token)
+ */
 exports.refreshToken = asyncHandler(async (req, res) => {
   const { token } = req.body;
   if (!token) return errorResponse(res, "No refresh token provided", 401);
 
-  // SHA256 lookup
-  const sha256Hash = crypto.createHash("sha256").update(token).digest("hex");
-  const session = await Session.findOne({ sha256Hash });
-
-  if (!session || session.revokedAt) {
-    return errorResponse(res, "Invalid or expired refresh token", 401);
+  try {
+    const { accessToken, refreshToken } = await authService.rotateRefreshToken(token, req);
+    return successResponse(res, "Token refreshed successfully", { accessToken, refreshToken });
+  } catch (err) {
+    return errorResponse(res, err.message || "Invalid refresh token", 401);
   }
-
-  // Verify with bcrypt
-  const match = await bcrypt.compare(token, session.bcryptHash);
-  if (!match) {
-    return errorResponse(res, "Invalid refresh token", 401);
-  }
-
-  const user = await User.findById(session.user);
-  if (!user) return errorResponse(res, "User not found", 404);
-
-  // Issue new tokens
-  const accessToken = generateAccessToken(user);
-  const newRefreshToken = await generateRefreshToken(user, req);
-
-  // Revoke old session
-  session.revokedAt = new Date();
-  await session.save();
-
-  successResponse(res, "Token refreshed successfully", {
-    accessToken,
-    refreshToken: newRefreshToken,
-  });
 });
 
-// @desc Logout user
+/**
+ * Logout (revoke a refresh token)
+ * Expects protected route (req.user present)
+ */
 exports.logout = asyncHandler(async (req, res) => {
   const { token } = req.body;
-  if (!token) return errorResponse(res, "No refresh token provided", 401);
+  if (!token) return errorResponse(res, "No refresh token provided", 400);
 
-  const sha256Hash = crypto.createHash("sha256").update(token).digest("hex");
-  const session = await Session.findOne({ sha256Hash });
+  const revoked = await authService.revokeRefreshToken(token, req.user.id);
+  if (!revoked) return errorResponse(res, "Refresh token not found or not owned by user", 400);
 
-  if (session && session.user.toString() === req.user.id) {
-    session.revokedAt = new Date();
-    await session.save();
+  await logAudit({
+    actor: req.user.id,
+    action: "auth:logout",
+    resourceType: "Session",
+    resourceId: token.slice(0, 12), // avoid logging full token
+    reason: "User logout",
+  });
+
+  return successResponse(res, "Logged out successfully");
+});
+
+/**
+ * Forgot Password - generate reset token and notify user.
+ * For security: always respond with success (avoid user enumeration).
+ */
+exports.forgotPassword = asyncHandler(async (req, res) => {
+  const { email, roleNumber } = req.body;
+
+  const user = await User.findOne({ $or: [{ email }, { roleNumber }] });
+  if (user) {
+    // Create reset token and notify
+    const token = await authService.generatePasswordResetToken(user);
+
+    // Send via notification/email (best-effort)
+    try {
+      await sendNotification("Password reset instructions", user._id.toString(), {
+        channel: "email",
+        title: "Password reset",
+        data: { token },
+        createdBy: null,
+      });
+      if (process.env.NODE_ENV === "development") {
+        // dev fallback for convenience
+        console.log("Password reset token (dev):", token);
+      }
+    } catch (err) {
+      console.error("Notification error (non-fatal):", err && err.message ? err.message : err);
+    }
   }
 
-  successResponse(res, "Logged out successfully");
+  // Always return success response to callers
+  return successResponse(res, "If an account exists, password reset instructions have been sent.");
+});
+
+/**
+ * Reset Password - verify token, update password, revoke sessions
+ */
+exports.resetPassword = asyncHandler(async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) return errorResponse(res, "Token and newPassword are required", 400);
+
+  try {
+    const resetRecord = await authService.verifyPasswordResetToken(token);
+    const user = await User.findById(resetRecord.user);
+    if (!user) return errorResponse(res, "User not found", 404);
+
+    // capture a minimal before snapshot (avoid storing raw hashes in audit)
+    const before = { passwordSet: !!user.passwordHash };
+
+    // update password
+    const salt = await bcrypt.genSalt(10);
+    user.passwordHash = await bcrypt.hash(newPassword, salt);
+    await user.save();
+
+    // mark reset used and revoke sessions
+    await authService.markPasswordResetUsed(resetRecord);
+    await authService.revokeAllSessionsForUser(user._id);
+
+    await logAudit({
+      actor: user._id,
+      action: "auth:password-reset",
+      resourceType: "User",
+      resourceId: user._id.toString(),
+      before,
+      after: { passwordSet: true },
+      reason: "Password reset via token",
+    });
+
+    // notify user
+    try {
+      await sendNotification("Your password has been changed", user._id.toString(), {
+        channel: "email",
+        title: "Password changed",
+        createdBy: null,
+      });
+    } catch (err) {
+      console.error("Notification error (non-fatal):", err && err.message ? err.message : err);
+    }
+
+    return successResponse(res, "Password reset successful. Please login again.");
+  } catch (err) {
+    return errorResponse(res, err.message || "Invalid or expired token", 400);
+  }
 });

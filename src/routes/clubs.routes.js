@@ -1,16 +1,10 @@
+// src/routes/clubs.routes.js
 const express = require("express");
-const {
-  createClub,
-  getAllClubs,
-  getClubById,
-  updateClub,
-  deleteClub,
-} = require("../controllers/clubs.controller");
-
+const { createClub, getAllClubs, getClubById, updateClub, deleteClub } = require("../controllers/clubs.controller");
 const validate = require("../middlewares/validate.middleware");
 const { createClubSchema, updateClubSchema } = require("../validators/club.validators");
 const protect = require("../middlewares/auth.middleware");
-const roleAuth = require("../middlewares/permission.middleware");
+const { roleAuth } = require("../middlewares/permission.middleware"); // roleAuth: compatibility helper
 
 const router = express.Router();
 
@@ -22,7 +16,7 @@ router.get("/:id", getClubById);
 router.post("/", protect, roleAuth("admin", "club-coordinator"), validate(createClubSchema), createClub);
 router.delete("/:id", protect, roleAuth("admin", "club-coordinator"), deleteClub);
 
-// Admin or Core Member can update
-router.put("/:id", protect, updateClub); 
+// Admin or Core Member can update (controller enforces core membership)
+router.put("/:id", protect, validate(updateClubSchema), updateClub);
 
 module.exports = router;
